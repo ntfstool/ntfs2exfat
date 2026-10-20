@@ -12,6 +12,7 @@ public struct SourceSnapshot: Codable, Equatable, Sendable {
     public var diskUUID: String?
     public var totalSize: Int64
     public var mountPoint: String
+    public var partitionSize: Int64?     // 分区字节数，用来认盘（旧任务没有这个字段）
 }
 
 /// 一次迁移任务的持久状态（job.json）。
@@ -36,11 +37,26 @@ public enum MigrationError: Error, CustomStringConvertible, Equatable {
     case wrongPhase(expected: String, actual: String)
     case backupNotVerified(failed: Int, pending: Int)
     case backupModified([String])
+    case sourceModified([String])
+    case sourceShared(String)
     case diskChanged(String)
     case confirmationMismatch
     case targetNotMounted
     case targetTooSmall(needed: Int64, available: Int64)
     case restoreIncomplete(failed: Int)
+
+    /// 不含文件名的简短错误类别，用于匿名上报。
+    public var code: String {
+        switch self {
+        case .notNTFS: return "notNTFS"; case .systemOrInternalDisk: return "internalDisk"; case .notMounted: return "notMounted"
+        case .backupOnSameDisk: return "sameDisk"; case .notEnoughBackupSpace: return "backupSpace"
+        case .wrongPhase(let e, let a): return "wrongPhase:\(e)>\(a)"
+        case .backupNotVerified: return "backupNotVerified"; case .backupModified: return "backupModified"
+        case .sourceModified: return "sourceModified"; case .sourceShared: return "sourceShared"; case .diskChanged(let why): return "diskChanged:\(why)"
+        case .confirmationMismatch: return "nameMismatch"; case .targetNotMounted: return "targetNotMounted"
+        case .targetTooSmall: return "targetTooSmall"; case .restoreIncomplete: return "restoreIncomplete"
+        }
+    }
 
     public var description: String {
         switch self {
@@ -52,6 +68,8 @@ public enum MigrationError: Error, CustomStringConvertible, Equatable {
         case .wrongPhase(let e, let a): return "this step needs phase '\(e)', but the job is at '\(a)'"
         case .backupNotVerified(let f, let p): return "backup is not fully verified (\(f) failed, \(p) pending)"
         case .backupModified(let p): return "backup files changed or went missing since verification (\(p.count) files, e.g. \(p.first ?? ""))"
+        case .sourceModified(let p): return "files on the drive changed after the backup (\(p.count) files, e.g. \(p.first ?? "")); back up again before formatting"
+        case .sourceShared(let why): return "the drive must be used by NTFS2exFAT alone and read-only: \(why)"
         case .diskChanged(let why): return "the disk is not the one the backup was made from (\(why))"
         case .confirmationMismatch: return "the typed volume name does not match"
         case .targetNotMounted: return "the new exFAT volume did not mount"
@@ -85,6 +103,8 @@ public final class MigrationJob: @unchecked Sendable {
         guard info.fileSystem.contains("ntfs") else { throw MigrationError.notNTFS(info.fileSystem) }
         guard !info.isInternal else { throw MigrationError.systemOrInternalDisk }
         guard let mount = info.mountPoint else { throw MigrationError.notMounted }
+        // 必须先 prepareSource：别的驱动同时挂着这块盘时，系统挂载点可能是旧缓存，扫描会漏掉文件
+        if let p = DiskUtil.exclusivityProblem(info.identifier) { throw MigrationError.sourceShared(p) }
         // 备份位置：不能在即将被擦除的那块物理盘上；空间必须足够（已用空间 ×1.05 + 64MB）
         if let b = DiskUtil.volumeInfo(forPath: backupRoot), b.wholeDisk == info.wholeDisk { throw MigrationError.backupOnSameDisk }
         let used = max(0, info.totalSize - (info.freeSpace ?? 0))
@@ -96,11 +116,27 @@ public final class MigrationJob: @unchecked Sendable {
         let manifest = try Manifest(url: dir.appendingPathComponent("manifest.jsonl"))
         let state = JobState(id: jobID, createdAt: Date(), phase: .created,
                              source: SourceSnapshot(identifier: info.identifier, wholeDisk: info.wholeDisk, volumeName: info.volumeName,
-                                                    volumeUUID: info.volumeUUID, diskUUID: info.diskUUID, totalSize: info.totalSize, mountPoint: mount),
+                                                    volumeUUID: info.volumeUUID, diskUUID: info.diskUUID, totalSize: info.totalSize, mountPoint: mount,
+                                                    partitionSize: info.partitionSize),
                              sourceRoot: mount, backupRoot: backupRoot, targetRoot: nil, newLabel: nil, renamedOnRestore: 0, note: nil, eraseStarted: nil, targetIdentifier: nil)
         let job = MigrationJob(state: state, directory: dir, manifest: manifest, concurrency: concurrency)
         try job.save()
         return job
+    }
+
+    /// 开始之前调用：卸掉这块盘的所有挂载（包括 NTFSTool 等其它驱动的读写挂载），再以只读方式重新挂载。
+    /// 需要卸载别的驱动的挂载时可能要管理员权限（elevate）。返回新的挂载点。
+    public static func prepareSource(_ id: String, elevate: DiskUtil.Elevator? = nil) async throws -> String {
+        try await DiskUtil.remountExclusiveReadOnly(id, elevate: elevate)
+    }
+
+    /// 读源盘之前确认：仍是独占、只读挂载；挂载点变了（拔插过）就更新。
+    func ensureSourceReady() throws {
+        let info = try DiskUtil.info(state.source.identifier)
+        guard let mount = info.mountPoint else { throw MigrationError.notMounted }
+        if info.volumeUUID != state.source.volumeUUID || info.diskUUID != state.source.diskUUID { throw MigrationError.diskChanged("volume identity differs") }
+        if let p = DiskUtil.exclusivityProblem(state.source.identifier) { throw MigrationError.sourceShared(p) }
+        if mount != state.sourceRoot { state.sourceRoot = mount; try save() }
     }
 
     /// 从任务目录恢复（程序重启 / 断点续传）。
@@ -126,6 +162,7 @@ public final class MigrationJob: @unchecked Sendable {
 
     public func scan(options: ScanOptions = .init()) async throws -> ScanReport {
         try require([.created, .scanned])
+        try ensureSourceReady()
         var report = try await Scanner.scan(root: state.sourceRoot, options: options, into: manifest, cancel: { self.engine.isCancelled })
         // 对账：卷的已用空间减去我们看到的文件，剩余应只是 NTFS 元数据（$MFT、日志、簇内碎片）。
         if let info = try? DiskUtil.info(state.source.identifier), let free = info.freeSpace {
@@ -143,6 +180,7 @@ public final class MigrationJob: @unchecked Sendable {
 
     public func backup(progress: @escaping @Sendable (JobProgress) -> Void = { _ in }) async throws -> PhaseResult {
         try require([.scanned, .created])
+        try ensureSourceReady()
         let r = try await engine.backup(sourceRoot: state.sourceRoot, dataRoot: dataRoot, progress: progress)
         if !r.cancelled { try advance(to: .backedUp) }
         return r
@@ -170,10 +208,41 @@ public final class MigrationJob: @unchecked Sendable {
         if !bad.isEmpty { problems.append(.backupModified(bad)) }
         if let cur = try? DiskUtil.info(state.source.identifier) {
             if cur.volumeUUID != state.source.volumeUUID || cur.diskUUID != state.source.diskUUID { problems.append(.diskChanged("volume identity differs")) }
-            if cur.totalSize != state.source.totalSize { problems.append(.diskChanged("size differs")) }
+            // 用分区字节数认盘：statfs 报的容量会随挂载驱动变化（例如被 NTFSTool 以读写方式重新挂载），会误判成"换了盘"
+            if let ps = state.source.partitionSize { if cur.partitionSize != ps { problems.append(.diskChanged("size differs")) } }
+            else if cur.totalSize != state.source.totalSize && cur.partitionSize != state.source.totalSize { problems.append(.diskChanged("size differs")) }
             if cur.isInternal { problems.append(.systemOrInternalDisk) }
+            if let p = DiskUtil.exclusivityProblem(state.source.identifier) { problems.append(.sourceShared(p)) }
+            // 备份之后盘可能被以读写方式重新挂载并被改动：改动过的文件不在备份里，格式化会丢掉它们
+            if let mount = cur.mountPoint {
+                let changed = await sourceChanges(root: mount)
+                if !changed.isEmpty { problems.append(.sourceModified(changed)) }
+            }
         } else { problems.append(.diskChanged("the disk is no longer connected")) }
         return problems
+    }
+
+    /// 快速核对源盘：备份过的每个文件仍在、大小和修改时间不变；也找出备份后新增的顶层条目。只用 stat，很快。
+    func sourceChanges(root: String) async -> [String] {
+        var out: [String] = []
+        let all = await manifest.all
+        for e in all where e.kind == .file && e.backup != .skipped {
+            var st = stat()
+            if lstat(root + "/" + e.path, &st) != 0 { out.append(e.path); continue }
+            let mtime = Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+            if Int64(st.st_size) != e.size || abs(mtime - e.mtime) > 2 { out.append(e.path) }
+            if out.count >= 50 { return out }
+        }
+        let known = Set(all.map { $0.path.split(separator: "/").first.map(String.init) ?? $0.path })
+        let skippedTop = Set(ScanOptions().skippedNames)
+        for name in (try? listDirectory(root)) ?? [] where !known.contains(name) && !skippedTop.contains(name) && !name.hasPrefix(".n2etmp") {
+            // 列得出但 lstat 失败的是残缺目录项（扫描时已记为"读不出来"并由用户确认），不算新增
+            var st = stat()
+            guard lstat(root + "/" + name, &st) == 0 else { continue }
+            out.append(name)
+            if out.count >= 50 { break }
+        }
+        return out
     }
 
     /// 格式化为 exFAT。用户必须输入与当前卷名完全一致的文字。成功后任务进入 formatted，并记录新卷挂载点。
@@ -201,6 +270,31 @@ public final class MigrationJob: @unchecked Sendable {
         return false
     }
 
+    /// 重新定位格式化后的新卷：优先按记录的标识符，其次按"同一块物理盘上的 exFAT 卷"。找到则更新挂载点。
+    func refreshTarget() async throws -> Bool {
+        for _ in 0..<20 {
+            var v: DiskUtil.Info?
+            if let id = state.targetIdentifier, let i = try? DiskUtil.info(id), i.fileSystem == "exfat", i.mountPoint != nil { v = i }
+            if v == nil { v = (try? DiskUtil.externalVolumes())?.first(where: { $0.wholeDisk == state.source.wholeDisk && $0.fileSystem == "exfat" && $0.mountPoint != nil }) }
+            if let v, let mount = v.mountPoint, DiskUtil.volumeInfo(forPath: mount)?.identifier == v.identifier {
+                if state.targetRoot != mount || state.targetIdentifier != v.identifier { state.targetRoot = mount; state.targetIdentifier = v.identifier; try save() }
+                return true
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
+    }
+
+    /// 拷回没有全部成功的文件（给界面列出来）。
+    public func failedRestores(limit: Int = 200) async -> [ManifestEntry] {
+        Array(await manifest.all.filter { $0.kind == .file && $0.restore == .failed }.prefix(limit))
+    }
+
+    /// 没写回新盘的附属信息（"._*"），写进报告。
+    public func skippedMetadata() async -> [ManifestEntry] {
+        await manifest.all.filter { $0.kind == .file && $0.isAppleDouble && $0.restore == .skipped }
+    }
+
     /// 断点恢复：如果上次在格式化过程中被打断（崩溃、断电、关闭程序），检查磁盘是否已经变成 exFAT。
     /// 返回 true 表示已确认格式化完成并进入 formatted；false 表示磁盘仍是原样（可以重新格式化）。
     public func recoverInterruptedErase() async throws -> Bool {
@@ -212,11 +306,12 @@ public final class MigrationJob: @unchecked Sendable {
     public func restore(progress: @escaping @Sendable (JobProgress) -> Void = { _ in }) async throws -> PhaseResult {
         if state.phase == .backupVerified { _ = try await recoverInterruptedErase() }
         try require([.formatted, .restored])
-        guard let target = state.targetRoot else { throw MigrationError.targetNotMounted }
-        let s = await manifest.summary()
-        if let info = try? DiskUtil.info(mountPoint: target), let free = info.freeSpace {
-            // exFAT 簇会浪费一些空间：按 128KB 簇估算
-            let needed = Int64(Double(s.bytes) * 1.02)
+        // 续传时盘可能被拔插过，挂载点会变（"/Volumes/X 1"）。每次都重新确认目标是这块物理盘上已装载的 exFAT 卷，
+        // 绝不往一个只是路径相同的目录里写。
+        guard try await refreshTarget(), let target = state.targetRoot else { throw MigrationError.targetNotMounted }
+        if let free = DiskUtil.freeSpace(forPath: target) {
+            // 只算还没拷回的部分（续传时盘上已经有一部分了）；exFAT 簇会浪费一些空间，按 2% 估算
+            let needed = Int64(Double(await engine.remainingRestoreBytes()) * 1.02)
             if free < needed { throw MigrationError.targetTooSmall(needed: needed, available: free) }
         }
         state.renamedOnRestore = await engine.planRestorePaths(); try save()
@@ -232,19 +327,31 @@ public final class MigrationJob: @unchecked Sendable {
 
     /// 生成最终报告（report.json + report.txt），并把任务标记为完成。
     public func finish() async throws -> String {
-        try require([.restored, .completed])
         let s = await manifest.summary()
-        if s.restoreFailed > 0 { throw MigrationError.restoreIncomplete(failed: s.restoreFailed) }
+        if s.restoreFailed > 0 || (state.phase == .formatted && s.restorePending > 0) {
+            throw MigrationError.restoreIncomplete(failed: s.restoreFailed + s.restorePending)
+        }
+        try require([.restored, .completed])
         var lines = ["NTFS2exFAT report", "Job: \(state.id)", "Source: \(state.source.volumeName) (\(state.source.identifier))",
                      "Files: \(s.files)  Folders: \(s.dirs)  Bytes: \(s.bytes)", "Backup verified: \(s.backupVerified)/\(s.files)",
-                     "Restore verified: \(s.restoreVerified)/\(s.files)", "Renamed for exFAT: \(state.renamedOnRestore)",
+                     "Restore verified: \(s.restoreVerified)/\(s.files - s.metadataSkipped)", "Renamed for exFAT: \(state.renamedOnRestore)",
                      "Skipped (links etc.): \(s.skipped)",
-                     "Metadata sidecars (._*): \(s.sidecars) (applied by macOS as extended attributes; not byte-verified)", "New volume: \(state.newLabel ?? "?") at \(state.targetRoot ?? "?")"]
+                     "Metadata sidecars (._*): \(s.sidecars) (applied as extended attributes; not byte-verified)",
+                     "Metadata not applied: \(s.metadataSkipped) (Finder tags etc. only, file contents are fine; originals kept in the backup)",
+                     "New volume: \(state.newLabel ?? "?") at \(state.targetRoot ?? "?")"]
         for e in await manifest.all where e.restoredPath != nil { lines.append("renamed: \(e.path) -> \(e.restoredPath!)") }
+        for e in await skippedMetadata() { lines.append("metadata not applied: \(e.path) — \(e.error ?? "")") }
+        if let t = state.targetRoot { removeTempLeftovers(root: t) }
         let text = lines.joined(separator: "\n") + "\n"
         try text.write(to: directory.appendingPathComponent("report.txt"), atomically: true, encoding: .utf8)
         try advance(to: .completed)
         return text
+    }
+
+    /// 清理中断后残留在新盘上的临时文件（.n2etmp-*）。
+    func removeTempLeftovers(root: String) {
+        guard let it = FileManager.default.enumerator(atPath: root) else { return }
+        for case let rel as String in it where (rel as NSString).lastPathComponent.hasPrefix(".n2etmp") { unlink(root + "/" + rel) }
     }
 
     /// 备份是否可以删除：只有任务完成且全部校验通过才返回 true。删除由用户决定，库不会自动删。

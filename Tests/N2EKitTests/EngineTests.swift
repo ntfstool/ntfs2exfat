@@ -81,8 +81,60 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: target + "/System Volume Information"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: target + "/link"))   // 符号链接不会被拷回
         // 没有残留的临时文件
-        let leftovers = (FileManager.default.enumerator(atPath: data)?.allObjects as? [String] ?? []).filter { $0.hasSuffix(".n2etmp") }
+        let leftovers = (FileManager.default.enumerator(atPath: data)?.allObjects as? [String] ?? []).filter { ($0 as NSString).lastPathComponent.hasPrefix(".n2etmp") }
         XCTAssertTrue(leftovers.isEmpty)
+    }
+
+    /// "._X" 附属文件：必须解包成 X 的扩展属性（含非 ASCII 名字），孤立的只记 skipped，不能算失败或卡住任务。
+    func testSidecarsAppliedAsMetadataAndOrphansSkipped() async throws {
+        let src = try makeSource()
+        // 用 copyfile PACK 造一个真实的 AppleDouble（带 Finder 标签）
+        let carrier = tmp.appendingPathComponent("carrier").path
+        FileManager.default.createFile(atPath: carrier, contents: Data("x".utf8))
+        let tag = Data("<plist><array><string>Red</string></array></plist>".utf8)
+        XCTAssertEqual(tag.withUnsafeBytes { setxattr(carrier, "com.apple.metadata:_kMDItemUserTags", $0.baseAddress, tag.count, 0, 0) }, 0)
+        XCTAssertEqual(copyfile(carrier, src + "/中文/._文件 名.txt", nil, copyfile_flags_t(COPYFILE_PACK | COPYFILE_XATTR)), 0)
+        try FileManager.default.copyItem(atPath: src + "/中文/._文件 名.txt", toPath: src + "/._ghost.txt")   // 孤立
+        let (engine, m) = try await makeEngine()
+        _ = try await Scanner.scan(root: src, into: m)
+        let data = tmp.appendingPathComponent("job/data").path, target = tmp.appendingPathComponent("exfat").path
+        try FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+        _ = try await engine.backup(sourceRoot: src, dataRoot: data); _ = try await engine.verifyBackup(dataRoot: data)
+        _ = await engine.planRestorePaths()
+        let r = try await engine.restore(dataRoot: data, targetRoot: target)
+        XCTAssertEqual(r.failed, 0)
+        _ = try await engine.verifyRestore(targetRoot: target)
+        let s = await m.summary()
+        XCTAssertEqual(s.restoreFailed, 0); XCTAssertEqual(s.restorePending, 0)
+        XCTAssertEqual(s.metadataSkipped, 1)
+        XCTAssertGreaterThan(getxattr(target + "/中文/文件 名.txt", "com.apple.metadata:_kMDItemUserTags", nil, 0, 0, 0), 0)
+        XCTAssertEqual(try String(contentsOfFile: target + "/中文/文件 名.txt"), "unicode")
+    }
+
+    /// 续传：第一次有文件拷回失败，修好原因后再跑只拷剩下的；空间检查只算剩余量。
+    func testRestoreResumesOnlyMissingFiles() async throws {
+        let src = try makeSource()
+        let (engine, m) = try await makeEngine()
+        _ = try await Scanner.scan(root: src, into: m)
+        let data = tmp.appendingPathComponent("job/data").path, target = tmp.appendingPathComponent("exfat").path
+        try FileManager.default.createDirectory(atPath: target, withIntermediateDirectories: true)
+        _ = try await engine.backup(sourceRoot: src, dataRoot: data); _ = try await engine.verifyBackup(dataRoot: data)
+        _ = await engine.planRestorePaths()
+        // 让 big.bin 写不进去：目标位置先放一个同名目录
+        try FileManager.default.createDirectory(atPath: target + "/big.bin/blocker", withIntermediateDirectories: true)
+        let r1 = try await engine.restore(dataRoot: data, targetRoot: target)
+        _ = try await engine.verifyRestore(targetRoot: target)
+        XCTAssertEqual(r1.failed, 1)
+        let remaining = await engine.remainingRestoreBytes()
+        XCTAssertEqual(remaining, 9 * 1024 * 1024 + 7)
+        try FileManager.default.removeItem(atPath: target + "/big.bin")
+        let r2 = try await engine.restore(dataRoot: data, targetRoot: target)
+        XCTAssertEqual(r2.failed, 0); XCTAssertEqual(r2.done, 1)
+        _ = try await engine.verifyRestore(targetRoot: target)
+        let s = await m.summary()
+        XCTAssertEqual(s.restoreFailed, 0); XCTAssertEqual(s.restorePending, 0)
+        let remainingAfter = await engine.remainingRestoreBytes()
+        XCTAssertEqual(remainingAfter, 0)
     }
 
     func testVerifyCatchesCorruptedBackup() async throws {

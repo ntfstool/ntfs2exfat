@@ -99,6 +99,8 @@ public actor Manifest {
         public var restoreVerified = 0, restoreFailed = 0, restorePending = 0
         public var skipped = 0
         public var sidecars = 0          // ._* 附属文件数（拷回后由 macOS 合并为扩展属性，不做字节校验）
+        public var metadataSkipped = 0   // 没能写回新盘的 ._* 附属信息（孤立的或新盘不接受的）；原样留在备份里，不算失败
+        public init() {}
     }
 
     public func summary() -> Summary {
@@ -111,7 +113,12 @@ public actor Manifest {
             }
             if e.backup == .skipped { s.skipped += 1; continue }
             switch e.backup { case .verified: s.backupVerified += 1; case .failed: s.backupFailed += 1; default: s.backupPending += 1 }
-            switch e.restore { case .verified: s.restoreVerified += 1; case .failed: s.restoreFailed += 1; default: s.restorePending += 1 }
+            switch e.restore {
+            case .verified: s.restoreVerified += 1
+            case .failed: s.restoreFailed += 1
+            case .skipped: s.metadataSkipped += 1
+            default: s.restorePending += 1
+            }
         }
         return s
     }

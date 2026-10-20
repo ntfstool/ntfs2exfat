@@ -126,15 +126,18 @@ public final class CopyEngine: @unchecked Sendable {
     }
 
     // MARK: 阶段 4：拷回（备份目录 → 新 exFAT 盘），同时核对备份哈希
+    /// 分两轮：先拷普通文件，再把 "._*" 附属信息写回到对应文件上。
+    /// 不能把 "._X" 当普通文件直接写到 exFAT：macOS 会把这个名字当成 X 的扩展属性处理，
+    /// X 不存在或名字含非 ASCII 字符时 rename 直接报 ENOENT（2026-10 真实用户在这里卡住）。
     public func restore(dataRoot: String, targetRoot: String, progress: @escaping @Sendable (JobProgress) -> Void = { _ in }) async throws -> PhaseResult {
         let all = await manifest.all
         for e in all where e.kind == .dir && e.restore != .verified {
             try FileManager.default.createDirectory(atPath: targetRoot + "/" + (e.restoredPath ?? e.path), withIntermediateDirectories: true)
             var d = e; d.restore = .verified; await manifest.upsert(d)
         }
-        let todo = all.filter { $0.kind == .file && $0.backup == .verified && ($0.restore == .pending || $0.restore == .failed) }
+        let todo = all.filter { $0.kind == .file && !$0.isAppleDouble && $0.backup == .verified && ($0.restore == .pending || $0.restore == .failed) }
         let box = JobProgressBox(phase: "restore", bytesTotal: todo.reduce(0) { $0 + $1.size }, filesTotal: todo.count, report: progress)
-        let result = try await runPool(todo, box: box) { e in
+        var result = try await runPool(todo, box: box) { e in
             let dst = targetRoot + "/" + (e.restoredPath ?? e.path)
             do {
                 let r = try FileCopier.copy(from: dataRoot + "/" + Self.bpath(e), to: dst, mtime: e.mtime,
@@ -150,12 +153,49 @@ public final class CopyEngine: @unchecked Sendable {
             catch CopyError.diskFull { var u = e; u.restore = .failed; u.error = "target disk full"; await self.manifest.upsert(u); throw CopyError.diskFull }
             catch { var u = e; u.restore = .failed; u.error = "restore: \(error)"; await self.manifest.upsert(u); return .failed }
         }
+        if result.cancelled { await manifest.flush(); return result }
+        let meta = await restoreSidecars(dataRoot: dataRoot, targetRoot: targetRoot)
+        result.done += meta
         // 目录修改时间（深层先改，避免改完子项又被刷新）
         for e in all.filter({ $0.kind == .dir }).sorted(by: { $0.path.count > $1.path.count }) {
             var ts = [timespec(tv_sec: Int(e.mtime), tv_nsec: 0), timespec(tv_sec: Int(e.mtime), tv_nsec: 0)]
             utimensat(AT_FDCWD, targetRoot + "/" + (e.restoredPath ?? e.path), &ts, 0)
         }
+        await manifest.flush()
         return result
+    }
+
+    /// 把 "._X" 里的扩展属性/资源分叉解包到新盘上的 X（copyfile COPYFILE_UNPACK）。
+    /// 这些是 Finder 标签、隔离标记之类的附属信息，不是文件内容：写不回去时标记 skipped（写进报告），不算失败；
+    /// 原始 "._X" 一直保留在备份里。返回成功写回的个数。
+    func restoreSidecars(dataRoot: String, targetRoot: String) async -> Int {
+        let all = await manifest.all
+        var byPath: [String: ManifestEntry] = [:]
+        for e in all { byPath[e.path] = e }
+        var applied = 0
+        for e in all where e.isAppleDouble && e.backup == .verified && e.restore != .verified && e.restore != .skipped {
+            let name = (e.path as NSString).lastPathComponent
+            let dir = (e.path as NSString).deletingLastPathComponent
+            let ownerPath = dir.isEmpty ? String(name.dropFirst(2)) : dir + "/" + String(name.dropFirst(2))
+            var u = e
+            guard let owner = byPath[ownerPath], owner.kind != .symlink,
+                  owner.kind == .dir || owner.restore == .copied || owner.restore == .verified else {
+                u.restore = .skipped; u.error = "metadata: no matching file on the drive (kept in backup)"
+                await manifest.upsert(u); continue
+            }
+            let dst = targetRoot + "/" + (owner.restoredPath ?? owner.path)
+            let rc = copyfile(dataRoot + "/" + Self.bpath(e), dst, nil, copyfile_flags_t(COPYFILE_UNPACK | COPYFILE_XATTR))
+            if rc == 0 { u.restore = .verified; u.error = nil; applied += 1 }
+            else { u.restore = .skipped; u.error = "metadata: not applied (\(String(cString: strerror(errno)))); kept in backup" }
+            await manifest.upsert(u)
+        }
+        return applied
+    }
+
+    /// 拷回还需要的字节数（只算还没拷回成功的普通文件）。续传时盘上已有一部分，不能按总量算。
+    public func remainingRestoreBytes() async -> Int64 {
+        await manifest.all.filter { $0.kind == .file && !$0.isAppleDouble && $0.backup == .verified && ($0.restore == .pending || $0.restore == .failed) }
+            .reduce(0) { $0 + $1.size }
     }
 
     // MARK: 阶段 5：校验拷回（重新读取新盘上的文件）
