@@ -27,7 +27,14 @@ w("Video/big.mov", random.randbytes(48 * 1024 * 1024 + 321))
 w("empty.dat", b""); w("Docs/" + "L" * 200 + ".txt", b"long name")
 w("Case/Readme.txt", b"upper"); w("Case/README.TXT", b"lower")           # NTFS 区分大小写共存，exFAT 会撞名
 w("日本語/ファイル.txt", "こんにちは".encode()); w("emoji/😀.txt", b"emoji")
+w("Long/" + "N" * 250 + ".txt", b"near the 255 limit")                     # 临时文件名不能再加长
+w("Long/" + "长" * 80 + ".txt", "长文件名".encode())                        # 240 字节 UTF-8
 PY
+# Finder 标签：fuse-t 挂载不支持扩展属性，macOS 会把它存成 "._*" 附属文件——真实用户盘上大量存在，且常带非 ASCII 名
+TAGS='<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><array><string>Red</string></array></plist>'
+for f in "日本語/ファイル.txt" "Docs/项目 1/说明 文档.txt" "Photos/2024/IMG_0001.jpg"; do xattr -w com.apple.metadata:_kMDItemUserTags "$TAGS" "$W/mnt/$f"; done
+cp "$W/mnt/Photos/2024/._IMG_0001.jpg" "$W/mnt/Photos/2024/._ghost.jpg" 2>/dev/null || true   # 孤立的附属文件（对应文件不存在）
+ls -a "$W/mnt/日本語" | grep -q '^\._' && echo "   AppleDouble sidecars present on source" || echo "   (note: no ._ sidecars were created on the source)"
 sync; umount "$W/mnt"; sleep 2
 
 echo "== 2. attach 映像（macOS 原生只读挂载）并记录原盘文件树"
@@ -87,4 +94,8 @@ if missing or extra or wrong:
     print("FAIL missing:", missing[:5], "extra:", extra[:5], "wrong:", wrong[:5]); sys.exit(1)
 print("   OK: every file present with identical content")
 PY
+grep -q "^Metadata not applied: " <<<"$REPORT" && grep "^Metadata not applied: \|^metadata not applied: " <<<"$REPORT" | sed 's/^/   /'
+for f in "日本語/ファイル.txt" "Docs/项目 1/说明 文档.txt" "Photos/2024/IMG_0001.jpg"; do
+  xattr -p com.apple.metadata:_kMDItemUserTags "$NEWMNT/$f" >/dev/null 2>&1 && echo "   OK: Finder tag kept on $f" || { echo "FAIL: Finder tag lost on $f"; exit 1; }
+done
 echo "== E2E PASSED"

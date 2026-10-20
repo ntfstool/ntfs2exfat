@@ -43,6 +43,8 @@ func report(_ r: PhaseResult, _ what: String) throws {
 }
 
 func doStart(_ disk: String, _ backupDir: String) async throws -> MigrationJob {
+    let mount = try await MigrationJob.prepareSource(disk)
+    err("Mounted read-only, exclusively: \(mount)")
     let job = try MigrationJob.create(sourceVolume: disk, backupRoot: backupDir)
     err("Job: \(job.directory.path)")
     let rep = try await job.scan()
@@ -68,6 +70,14 @@ func doErase(_ job: MigrationJob, confirm: String) async throws {
 
 func doRestore(_ job: MigrationJob) async throws {
     let r = try await job.restore(progress: printProgress); try report(r, "Restore + verify")
+    let failed = await job.failedRestores(limit: 50)
+    if !failed.isEmpty {
+        err("Some files were not copied back. All of them are still safe in the backup:")
+        err("  \(job.dataRoot)")
+        for e in failed { err("  - \(e.path): \(e.error ?? "")") }
+        err("Fix the cause (free space, reconnect the drive) and run 'restore' again; only the missing files are copied.")
+        exit(1)
+    }
     let text = try await job.finish()
     print(text)
 }
@@ -95,7 +105,8 @@ do {
         let job = try MigrationJob.resume(directory: jobDir(args))
         let s = await job.summary()
         print("phase: \(job.state.phase.rawValue)\nsource: \(job.state.source.volumeName) (\(job.state.source.identifier))")
-        print("files: \(s.files)  backup verified: \(s.backupVerified)  restore verified: \(s.restoreVerified)  failed: \(s.backupFailed + s.restoreFailed)")
+        print("files: \(s.files)  backup verified: \(s.backupVerified)  restore verified: \(s.restoreVerified)  failed: \(s.backupFailed + s.restoreFailed)  metadata not applied: \(s.metadataSkipped)")
+        print("backup: \(job.dataRoot)")
     case "run":
         let confirm = option("--confirm")
         guard args.count >= 2, let confirm else { print(usage); exit(2) }

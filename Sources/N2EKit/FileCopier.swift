@@ -22,7 +22,7 @@ public enum FileCopier {
 
     static func hex(_ d: SHA256.Digest) -> String { d.map { String(format: "%02x", $0) }.joined() }
 
-    /// 拷贝 src → dst（先写 dst.n2etmp，成功后原子改名），边拷边算源内容的 SHA-256。
+    /// 拷贝 src → dst（先写同目录下的短临时文件，成功后原子改名），边拷边算源内容的 SHA-256。
     @discardableResult
     public static func copy(from src: String, to dst: String, mtime: Double? = nil,
                             cancel: @Sendable () -> Bool = { false }, progress: (Int64) -> Void = { _ in }) throws -> (sha256: String, bytes: Int64) {
@@ -33,7 +33,8 @@ public enum FileCopier {
 
         let parent = (dst as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        let tmp = dst + ".n2etmp"
+        // 临时文件名要短：原名已接近 255 字符上限时，"原名.n2etmp" 会超长导致每次都失败
+        let tmp = parent + "/.n2etmp-" + String(UInt32.random(in: 0...UInt32.max), radix: 16)
         let outFD = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         guard outFD >= 0 else { throw CopyError.posix("open destination", errno) }
         var outOpen = true

@@ -37,6 +37,9 @@ public enum DiskUtil {
         public var fileSystem: String      // 小写，如 ntfs / exfat
         public var mountPoint: String?
         public var totalSize: Int64
+        /// 分区本身的字节数（diskutil 的 Size）。不随挂载驱动变化——totalSize 来自 statfs，换驱动重新挂载后会有细微差别，
+        /// 不能拿来判断"是不是同一块盘"。
+        public var partitionSize: Int64
         public var freeSpace: Int64?
         public var volumeUUID: String?
         public var diskUUID: String?
@@ -53,14 +56,15 @@ public enum DiskUtil {
         }
         let fs = ((d["FilesystemType"] as? String) ?? (d["FilesystemName"] as? String) ?? "").lowercased()
         let mount = (d["MountPoint"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        var total = (d["TotalSize"] as? NSNumber)?.int64Value ?? (d["Size"] as? NSNumber)?.int64Value ?? 0
+        let partSize = (d["Size"] as? NSNumber)?.int64Value ?? (d["TotalSize"] as? NSNumber)?.int64Value ?? 0
+        var total = (d["TotalSize"] as? NSNumber)?.int64Value ?? partSize
         var free: Int64? = fs == "apfs" ? (d["APFSContainerFree"] as? NSNumber)?.int64Value : (d["FreeSpace"] as? NSNumber)?.int64Value
         if let mount, let a = try? FileManager.default.attributesOfFileSystem(forPath: mount) {
             if let t = (a[.systemSize] as? NSNumber)?.int64Value, t > 0 { total = t }
             if let f = (a[.systemFreeSize] as? NSNumber)?.int64Value { free = f }
         }
         return Info(identifier: (d["DeviceIdentifier"] as? String) ?? id, wholeDisk: (d["ParentWholeDisk"] as? String) ?? id,
-                    volumeName: (d["VolumeName"] as? String) ?? "", fileSystem: fs, mountPoint: mount, totalSize: total, freeSpace: free,
+                    volumeName: (d["VolumeName"] as? String) ?? "", fileSystem: fs, mountPoint: mount, totalSize: total, partitionSize: partSize, freeSpace: free,
                     volumeUUID: d["VolumeUUID"] as? String, diskUUID: d["DiskUUID"] as? String,
                     isInternal: (d["Internal"] as? Bool) ?? false,
                     isWritable: (d["WritableVolume"] as? Bool) ?? (d["Writable"] as? Bool) ?? false,
@@ -138,5 +142,103 @@ public extension DiskUtil {
             if parts.isEmpty, let id = disk["DeviceIdentifier"] as? String { ids.append(id) }
         }
         return ids.compactMap { try? info($0) }.filter { !$0.fileSystem.isEmpty }
+    }
+}
+
+// MARK: 独占访问
+// 同一块 NTFS 盘可能同时被多个驱动挂载（系统只读驱动 + NTFSTool/ntfs-3g 之类的读写驱动）。
+// 2026-10 实测：另一个驱动写入后，系统挂载点仍是旧缓存，只能看到 2750 个文件里的 12 个。
+// 如果按旧缓存扫描、备份、校验，再格式化，就会永久丢失没看到的文件。所以扫描前必须"卸掉所有挂载 → 自己只读重挂"，
+// 格式化前再确认没有别的驱动挂回来。
+public extension DiskUtil {
+    struct MountEntry: Equatable, Sendable {
+        public var source: String, mountPoint: String, type: String, readOnly: Bool
+    }
+
+    static func mountTable() -> [MountEntry] {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/sbin/mount")
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return [] }
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self); p.waitUntilExit()
+        return text.split(separator: "\n").compactMap { line in
+            // "<source> on <mountpoint> (<type>, opt, opt)"；挂载点可能含空格，以最后一个 " (" 为界
+            guard let on = line.range(of: " on "), let paren = line.range(of: " (", options: .backwards), on.upperBound <= paren.lowerBound else { return nil }
+            let opts = line[paren.upperBound...].dropLast().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            return MountEntry(source: String(line[..<on.lowerBound]), mountPoint: String(line[on.upperBound..<paren.lowerBound]),
+                              type: opts.first ?? "", readOnly: opts.contains("read-only"))
+        }
+    }
+
+    /// 命令行里带着这个设备的进程（ntfs-3g / NTFSTool 的 ntfstool-4g 之类的用户态驱动）。
+    static func userspaceDriverProcesses(_ id: String) -> [String] {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/ps"); p.arguments = ["-axww", "-o", "command="]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return [] }
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self); p.waitUntilExit()
+        return text.split(separator: "\n").map(String.init).filter { $0.contains("/dev/\(id) ") || $0.contains("/dev/r\(id) ") || $0.hasSuffix("/dev/\(id)") }
+    }
+
+    /// 打开着这个设备的用户态驱动进程的挂载点。
+    static func userspaceDriverMounts(_ id: String) -> [String] {
+        let table = mountTable()
+        var result: [String] = []
+        for line in userspaceDriverProcesses(id) {
+            for dev in ["/dev/\(id) ", "/dev/r\(id) "] {
+                guard let r = line.range(of: dev) else { continue }
+                // 设备参数之后就是挂载点（可能含空格）：在挂载表里找一个能匹配上的
+                let rest = String(line[r.upperBound...])
+                if let m = table.first(where: { rest.hasPrefix($0.mountPoint + " ") || rest == $0.mountPoint
+                                                || ($0.mountPoint.hasPrefix("/private") && (rest.hasPrefix(String($0.mountPoint.dropFirst(8)) + " ") || rest == String($0.mountPoint.dropFirst(8)))) }) {
+                    if !result.contains(m.mountPoint) { result.append(m.mountPoint) }
+                }
+            }
+        }
+        return result
+    }
+
+    /// 如果这块盘不是"只被系统挂载一次、而且只读"，返回原因；否则 nil。
+    static func exclusivityProblem(_ id: String) -> String? {
+        let fuse = userspaceDriverMounts(id)
+        if !fuse.isEmpty { return "another NTFS driver is using this drive (\(fuse.joined(separator: ", ")))" }
+        if let proc = userspaceDriverProcesses(id).first {
+            return "a program still has the drive open (\((proc.split(separator: " ").first.map { ($0 as NSString).lastPathComponent }) ?? "?"))"
+        }
+        let direct = mountTable().filter { $0.source == "/dev/\(id)" }
+        if direct.count > 1 { return "the drive is mounted \(direct.count) times" }
+        if let m = direct.first, !m.readOnly { return "the drive is mounted with write access (\(m.type)); it must be read-only while we work on it" }
+        return nil
+    }
+
+    /// 卸掉这块盘的所有挂载（含其它驱动的），再以只读方式重新挂载，保证看到的是盘上的真实内容。返回新挂载点。
+    static func remountExclusiveReadOnly(_ id: String, elevate: Elevator? = nil) async throws -> String {
+        sync()
+        for mp in userspaceDriverMounts(id) {
+            do { try runTool("/sbin/umount", [mp]) }
+            catch {
+                guard let elevate else { throw error }
+                try await elevate("/sbin/umount " + shellQuote(mp))
+            }
+        }
+        for _ in 0..<20 where !userspaceDriverMounts(id).isEmpty { try await Task.sleep(nanoseconds: 300_000_000) }
+        if !userspaceDriverMounts(id).isEmpty { throw DiskUtilError(command: "umount", status: 1, output: "another NTFS driver still holds the drive") }
+        for m in mountTable() where m.source == "/dev/\(id)" {
+            // 这里只会卸载只读挂载或刚才已经同步过的挂载；卸载失败（被 Finder/Spotlight 占用）再强制
+            if (try? run(["unmount", id], timeout: 60)) == nil { _ = try? run(["unmount", "force", id], timeout: 60) }
+            _ = m
+        }
+        try run(["mount", "readOnly", id], timeout: 120)
+        guard let mp = try info(id).mountPoint else { throw DiskUtilError(command: "diskutil mount readOnly", status: 1, output: "not mounted") }
+        if let p = exclusivityProblem(id) { throw DiskUtilError(command: "remount", status: 1, output: p) }
+        return mp
+    }
+
+    @discardableResult
+    static func runTool(_ path: String, _ args: [String]) throws -> String {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
+        try p.run(); let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+        let text = String(decoding: data, as: UTF8.self)
+        if p.terminationStatus != 0 { throw DiskUtilError(command: ([path] + args).joined(separator: " "), status: p.terminationStatus, output: text) }
+        return text
     }
 }
